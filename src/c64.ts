@@ -1,10 +1,13 @@
 /* The emulated C64: 64 KB RAM, the ROMs banked by $00/$01, the VIC-II (raster line, raster IRQ, badlines), both
  * CIAs (timers, interrupts, keyboard and joysticks, TOD), the SID registers the CPU can read, and colour RAM.
- * It is as exact as unpacking needs: whole instructions, a PAL timing of 63 cycles x 312 lines.
+ * It is as exact as unpacking needs: whole instructions, a PAL timing of 63 cycles x 312 lines. A 1541 can be put on
+ * the serial bus (drive.ts); without one nothing answers there.
  *
  * It also records, for every RAM address, which layer wrote it last and when, and when it was last read as data.
  * The unpacker finds the layers of a packed program from that. */
 import { Cpu, type Bus } from './cpu.ts';
+import { DRIVE_RATIO, type Drive } from './drive.ts';
+import { CYCLES } from './opcodes.ts';
 
 /** what a 256-byte page reads from */
 export const RAM = 0, ZP = 1, BASIC = 2, KERNAL = 3, CHAR = 4, IO = 5;
@@ -77,6 +80,13 @@ export class Cia {
   cra = 0; crb = 0;
   icr = 0; mask = 0;
   sdr = 0;
+  /**
+   * cycles a timer does not count yet: one started or loaded by a write waits for the rest of the writing
+   * instruction, and starts one cycle later still; its interrupt follows the underflow a cycle after that
+   */
+  waitA = 0; waitB = 0;
+  /** a write just started or loaded the timer (the C64 sets the wait, as it knows the instruction) */
+  startedA = false; startedB = false;
   /** TOD: tenths, seconds, minutes, hours (BCD) */
   readonly tod = new Uint8Array([0, 0, 0, 1]);
   private todCycles = 0;
@@ -88,8 +98,12 @@ export class Cia {
 
   advance(n: number): void {
     let underflowsA = 0;
+    const nb = n - Math.min(n, this.waitB);
+    this.waitB -= n - nb;
     if (this.cra & 1 && !(this.cra & 0x20)) {
-      this.ta -= n;
+      const na = n - Math.min(n, this.waitA);
+      this.waitA -= n - na;
+      this.ta -= na;
       while (this.ta < 0) {
         underflowsA++;
         this.icr |= 1;
@@ -99,7 +113,7 @@ export class Cia {
     }
     if (this.crb & 1) {
       const mode = (this.crb >> 5) & 3;
-      const count = mode === 0 ? n : mode >= 2 ? underflowsA : 0;
+      const count = mode === 0 ? nb : mode >= 2 ? underflowsA : 0;
       if (count) {
         this.tb -= count;
         while (this.tb < 0) {
@@ -159,8 +173,8 @@ export class Cia {
       case 0x8: case 0x9: case 0xa: case 0xb: if (!(this.crb & 0x80)) this.tod[r - 8] = v; return;
       case 0xc: this.sdr = v; return;
       case 0xd: if (v & 0x80) this.mask |= v & 0x1f; else this.mask &= ~v & 0x1f; return;
-      case 0xe: if (v & 0x10) this.ta = this.tal; this.cra = v & 0xef; return;
-      default: if (v & 0x10) this.tb = this.tbl; this.crb = v & 0xef;
+      case 0xe: if (v & 0x10) this.ta = this.tal; this.startedA = (v & 0x10) !== 0 || ((v & 1) !== 0 && !(this.cra & 1)); this.cra = v & 0xef; return;
+      default: if (v & 0x10) this.tb = this.tbl; this.startedB = (v & 0x10) !== 0 || ((v & 1) !== 0 && !(this.crb & 1)); this.crb = v & 0xef;
     }
   }
 }
@@ -175,7 +189,14 @@ export class Input {
   release(): void { this.keys.fill(0); this.joy1 = this.joy2 = 0; this.petscii = 0; }
 }
 
-export interface Roms { basic: Uint8Array; kernal: Uint8Array; chargen: Uint8Array; /** where they came from */ source: string }
+export interface Roms {
+  basic: Uint8Array; kernal: Uint8Array; chargen: Uint8Array;
+  /** where they came from */
+  source: string;
+  /** the 1541's DOS ROM (16 KB), for a disk, and where it came from */
+  drive?: Uint8Array;
+  driveSource?: string;
+}
 
 /** The machine state that can be saved and put back (the post-boot state is reused between files). */
 export interface MachineState {
@@ -202,6 +223,10 @@ export class C64 implements Bus {
   readonly input = new Input();
   readonly cpu: Cpu;
   cycles = 0;
+  /** the 1541 on the serial bus, and the C64 and drive cycles when it was attached */
+  drive: Drive | null = null;
+  private driveBase = 0;
+  private driveStart = 0;
 
   // --- tracking ---------------------------------------------------------------------------------------------------
   /** the layer that wrote each RAM byte last (BOOT, LOADED or a layer id) */
@@ -245,10 +270,38 @@ export class C64 implements Bus {
       for (let c = 0; c < 8; c++) if (cols & (1 << c)) rows &= ~this.input.keys[c];
       return rows & ~this.input.joy1 & 0xff;
     };
-    // serial bus: nothing is connected, so CLK IN and DATA IN follow the C64's own (inverted) outputs
-    this.cia2.inputA = () => 0x3f | (this.cia2.pra & 0x10 ? 0 : 0x40) | (this.cia2.pra & 0x20 ? 0 : 0x80);
+    // serial bus: CLK IN and DATA IN are low while either side pulls them; with no drive only the C64's own
+    // (inverted) outputs do
+    this.cia2.inputA = () => {
+      const d = this.drive;
+      if (d) return 0x3f | (d.clkLow ? 0 : 0x40) | (d.dataLow ? 0 : 0x80);
+      return 0x3f | (this.cia2.pra & 0x10 ? 0 : 0x40) | (this.cia2.pra & 0x20 ? 0 : 0x80);
+    };
     this.updateMap();
   }
+
+  // --- the serial bus -------------------------------------------------------------------------------------------
+  /** Put a 1541 on the serial bus; it runs from now on, behind the C64. */
+  attachDrive(d: Drive): void {
+    this.drive = d;
+    this.driveBase = this.cycles;
+    this.driveStart = d.cycles;
+    this.serialOut();
+  }
+
+  /** Let the drive catch up to C64 cycle `at`. */
+  syncDrive(at = this.cycles): void {
+    this.drive?.runUntil(this.driveStart + (at - this.driveBase) * DRIVE_RATIO);
+  }
+
+  /** the C64's ATN, CLK and DATA outputs (bits 3-5 of $dd00, through inverters: a 1 pulls the line low) */
+  private serialOut(): void {
+    const out = this.cia2.pra | ~this.cia2.ddra;
+    this.drive!.setC64((out & 0x08) !== 0, (out & 0x10) !== 0, (out & 0x20) !== 0);
+  }
+
+  /** the cycle in which the running instruction reaches the bus: its last one */
+  private get busCycle(): number { return this.cycles + CYCLES[this.cpu.lastOp & 0xff] - 1; }
 
   // --- banking ----------------------------------------------------------------------------------------------------
   updateMap(): void {
@@ -343,7 +396,11 @@ export class C64 implements Bus {
     if (a < 0xd800) return this.readSid(a & 0x1f);
     if (a < 0xdc00) return this.color[a & 0x3ff] & 0x0f;
     if (a < 0xdd00) return this.cia1.read(a & 0x0f);
-    if (a < 0xde00) return this.cia2.read(a & 0x0f);
+    if (a < 0xde00) {
+      // ($dd00 and $dd02, the serial port and its data direction: the drive catches up first)
+      if (this.drive && (a & 0x0d) === 0) this.syncDrive(this.busCycle);
+      return this.cia2.read(a & 0x0f);
+    }
     return 0;
   }
 
@@ -352,8 +409,21 @@ export class C64 implements Bus {
     if (a < 0xd400) this.vic.write(a & 0x3f, v);
     else if (a < 0xd800) this.sidRegs[a & 0x1f] = v;
     else if (a < 0xdc00) this.color[a & 0x3ff] = v & 0x0f;
-    else if (a < 0xdd00) this.cia1.write(a & 0x0f, v);
-    else if (a < 0xde00) this.cia2.write(a & 0x0f, v);
+    else if (a < 0xdd00) { this.cia1.write(a & 0x0f, v); this.timerStart(this.cia1); }
+    else if (a < 0xde00) {
+      const serial = this.drive && (a & 0x0d) === 0;
+      if (serial) this.syncDrive(this.busCycle);
+      this.cia2.write(a & 0x0f, v);
+      this.timerStart(this.cia2);
+      if (serial) this.serialOut();
+    }
+  }
+
+  /** a timer the write started waits for the rest of this instruction (see Cia.waitA) */
+  private timerStart(cia: Cia): void {
+    const wait = CYCLES[this.cpu.lastOp & 0xff] + 2;
+    if (cia.startedA) { cia.waitA = wait; cia.startedA = false; }
+    if (cia.startedB) { cia.waitB = wait; cia.startedB = false; }
   }
 
   private readSid(r: number): number {

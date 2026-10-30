@@ -1,18 +1,22 @@
-/* unpacker <file.prg> [options]: unpack a C64 program and report its layers. Run with `node src/cli.ts` (Node 22.18
+/* unpacker <file.prg | disk.d64> [options]: unpack a C64 program and report its layers. Run with `node src/cli.ts` (Node 22.18
  * or newer runs the TypeScript as it is), or `pnpm unpack` in this folder. */
 import { readFileSync, writeFileSync } from 'node:fs';
 import { basename, dirname, extname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { unpack, type LayerReport, type Saved, type UnpackOptions } from './session.ts';
 import { findRoms, loadRoms } from './node.ts';
+import { d64File, d64Pick } from './d64.ts';
 import type { Range } from './analyze.ts';
 
-const HELP = `unpacker <file.prg> [options]
+const HELP = `unpacker <file.prg | disk.d64> [options]
 
 Runs the program in an emulated C64, follows it through its layers (coders, movers, decrunchers) and saves
-the unpacked program when it starts.
+the unpacked program when it starts. With a disk (a D64, or --disk) a 1541 is on the serial bus, so the
+program can go on loading from it, with the KERNAL or a fast loader of its own.
 
   -o FILE        save here (default: <name>.<start address>.prg next to the file)
+  --file NAME    the file on the D64 to unpack (default: its first PRG; * and ? as the DOS takes them)
+  --disk FILE    put this D64 in the drive for a PRG given on its own
   -e ADDR        start with SYS ADDR instead of RUN
   -l ADDR        load the file at ADDR instead of its own load address
   --layer N      save layer N instead of the newest (see the report)
@@ -22,7 +26,8 @@ the unpacked program when it starts.
   --deep         also press keys when a later layer waits (an intro after the decrunching)
   --no-keys      never press keys
   --cycles N     give up after N million cycles (default 400)
-  --roms DIR     the folder with the C64 ROM files (default: a VICE installation, or $C64_ROMS)
+  --roms DIR     the folder with the C64 ROM files (default: a VICE installation, or $C64_ROMS); the 1541
+                 DOS ROM is taken from there or from VICE's DRIVES folder next to it
   --no-roms      use the built-in stand-ins instead of ROM files
   --json         print the result as JSON
   --trace        print every layer change and key press as it happens
@@ -67,11 +72,13 @@ function main(argv: string[]): number {
   const cwd = process.env.INIT_CWD ?? process.cwd();
   const o: UnpackOptions = {};
   let input: string | null = null, out: string | null = null, info = false, all = false, json = false, learn: string | null = null;
-  let roms: string | null | false = null;
+  let roms: string | null | false = null, fileName: string | null = null, diskPath: string | null = null;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
       case '-o': out = argv[++i]; break;
+      case '--file': fileName = argv[++i]; break;
+      case '--disk': diskPath = argv[++i]; break;
       case '-e': o.entry = parseAddr(argv[++i], '-e'); break;
       case '-l': o.load = parseAddr(argv[++i], '-l'); break;
       case '--layer': o.layer = Number(argv[++i]); break;
@@ -94,12 +101,21 @@ function main(argv: string[]): number {
   }
   if (!input) throw new Error('no file given');
   const path = resolve(cwd, input);
-  const file = new Uint8Array(readFileSync(path));
+  let file = new Uint8Array(readFileSync(path));
+  let base = join(dirname(path), basename(path, extname(path))), shown = basename(path);
+  if (/\.d64$/i.test(path)) {
+    const disk = file, entry = d64Pick(disk, fileName ?? undefined);
+    if (!entry) throw new Error(fileName ? `no PRG named "${fileName}" on the disk` : 'no PRG on the disk');
+    file = new Uint8Array(d64File(disk, entry));
+    o.disk = disk;
+    shown = `${basename(path)}: "${entry.name}"`;
+    base += `.${entry.name.replace(/[^A-Za-z0-9 _-]/g, '_').trim() || 'file'}`;
+  } else if (fileName) throw new Error('--file picks a file on a D64');
+  if (diskPath) o.disk = new Uint8Array(readFileSync(resolve(cwd, diskPath)));
   o.roms = roms === false ? null : roms ? loadRoms(resolve(cwd, roms)) : findRoms();
   if (roms && !o.roms) throw new Error(`no kernal, basic and chargen ROM files in ${roms}`);
 
   const r = unpack(file, o);
-  const base = join(dirname(path), basename(path, extname(path)));
   const written: string[] = [];
   const write = (s: Saved, name: string) => { writeFileSync(name, s.prg); written.push(name); };
   if (!info && r.saved) {
@@ -114,8 +130,9 @@ function main(argv: string[]): number {
     return r.unpacked ? 0 : 1;
   }
   const loadAt = o.load ?? (file[0] | (file[1] << 8));
-  console.log(`${basename(path)}: ${range({ start: loadAt, end: loadAt + file.length - 3 })} (${kb(file.length - 2)})${r.basic.length ? `, ${r.basic.slice(0, 2).join(' / ')}` : ''}`);
+  console.log(`${shown}: ${range({ start: loadAt, end: loadAt + file.length - 3 })} (${kb(file.length - 2)})${r.basic.length ? `, ${r.basic.slice(0, 2).join(' / ')}` : ''}`);
   console.log(`ROMs: ${r.roms}`);
+  if (r.drive) console.log(`Drive: ${r.drive}`);
   for (const l of r.layers) console.log(describe(l));
   const secs = (r.cycles / 985248).toFixed(1);
   console.log(`stopped after ${secs} s of C64 time (${Math.round(r.ms)} ms): ${r.stop.reason}${r.stop.detail ? `, ${r.stop.detail}` : ''}`);

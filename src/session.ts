@@ -9,7 +9,8 @@
  * layer that made the call again.
  *
  * The run stops when the newest layer settles (writes no new memory for a while), loads a file, returns to BASIC,
- * crashes or runs out of time. Then the newest layer is the unpacked program. An intro that waits before anything
+ * crashes or runs out of time. With a disk, a 1541 is on the serial bus and loading goes on: the KERNAL's and fast
+ * loaders' alike. Then the newest layer is the unpacked program. An intro that waits before anything
  * was unpacked gets keys pressed (space and fire first). */
 import { BASIC, BOOT, C64, KERNAL, LOADED, ZP, type MachineState, type Roms } from './c64.ts';
 import { OP_IRQ, OP_NMI } from './cpu.ts';
@@ -17,11 +18,18 @@ import { LEN } from './opcodes.ts';
 import { initStandIn, KERNAL_VECTORS, standInRoms } from './standin.ts';
 import { activity, fingerprintId, identify, strings, type Activity, type Kind, type Range } from './analyze.ts';
 import { buildPrg, contentMask, saveRange } from './output.ts';
+import { Drive, type DriveState } from './drive.ts';
+import { d64ToDisk } from './gcr.ts';
 import { basicLines, evaluate, findSys, listLine, statements, T } from './basic.ts';
 
 export interface UnpackOptions {
   /** the C64 ROMs; without them the stand-ins run (fine for most packers, but not for BASIC programs) */
   roms?: Roms | null;
+  /**
+   * the disk the file came from (a D64 image): with the 1541 DOS ROM in `roms` a 1541 with this disk is on the
+   * serial bus, so the program can load more files and run its fast loader
+   */
+  disk?: Uint8Array | null;
   /** start the program here (SYS) instead of RUN */
   entry?: number;
   /** load the file here instead of at its own load address */
@@ -112,6 +120,8 @@ export interface UnpackResult {
   /** the loaded file's BASIC lines, when it has some */
   basic: string[];
   roms: string;
+  /** the 1541 on the serial bus and its disk, or why there was none; null without a disk */
+  drive: string | null;
   /** emulated cycles from the program's start */
   cycles: number;
   ms: number;
@@ -169,6 +179,11 @@ const SYS_RETURN = 0xe146;
 const hex4 = (v: number) => '$' + v.toString(16).padStart(4, '0');
 
 const bootCache = new Map<string, MachineState>();
+/** the 1541 after it started up (by its ROM): it has long been on when a real C64 loads the file */
+const driveCache = new Map<string, DriveState>();
+const DRIVE_BOOT = 2_500_000;
+/** a program waiting while the drive's motor runs is loading, not settled: for this long at most (10 s) */
+const DRIVE_PATIENCE = 10_000_000;
 
 /** Unpack a PRG (load address first). */
 export function unpack(file: Uint8Array, options: UnpackOptions = {}): UnpackResult {
@@ -233,6 +248,11 @@ class Session {
   private basicStatements: number[][] = [];
   private basicPos = 0;
   private basicRunning = false;
+  /** the 1541 (with a disk and its DOS ROM), or why there is none */
+  private drive: Drive | null = null;
+  private driveNote: string | null = null;
+  /** since when the drive's motor runs without the program getting new data */
+  private driveBusy = 0;
 
   constructor(file: Uint8Array, o: UnpackOptions) {
     if (file.length < 3) throw new Error('not a PRG: shorter than 3 bytes');
@@ -253,6 +273,7 @@ class Session {
   run(): UnpackResult {
     const t0 = performance.now();
     if (this.real) this.bootReal(); else this.bootStandIn();
+    if (this.o.disk) this.attachDrive();
     if (!this.stopped) this.loop();
     return this.finish(performance.now() - t0);
   }
@@ -275,6 +296,25 @@ class Session {
     this.setPhase('boot');
   }
   private bootKey = '';
+
+  /** A 1541 with the disk on the serial bus, started up a while ago (it needs the real ROMs and its DOS ROM). */
+  private attachDrive(): void {
+    const rom = this.o.roms?.drive;
+    if (!this.real) { this.driveNote = 'the stand-ins have no serial bus: the disk was not used'; return; }
+    if (!rom) { this.driveNote = 'no 1541 DOS ROM: the disk was not used'; return; }
+    const disk = d64ToDisk(this.o.disk!);
+    const d = new Drive(rom), key = checksum(rom);
+    const booted = driveCache.get(key);
+    if (booted) d.restore(booted);
+    else {
+      while (d.cycles < DRIVE_BOOT) d.step();
+      driveCache.set(key, d.save());
+    }
+    d.insert(disk);
+    this.drive = d;
+    this.m.attachDrive(d);
+    this.driveNote = `1541 with "${disk.name}" ${disk.id}`;
+  }
 
   private bootStandIn(): void {
     const m = this.m;
@@ -503,16 +543,21 @@ class Session {
       if (this.phase !== 'run' && now - this.phaseAt > 20_000_000) { this.stop('not-started', `the C64 did not get through ${this.phase}`); return; }
     } else if (now - this.startCycle > this.maxCycles) { this.stop('budget', `still running after ${(this.maxCycles / 985248).toFixed(0)} s of C64 time`); return; }
     if (this.holdUntil && now >= this.holdUntil) { m.input.release(); this.holdUntil = 0; this.progressAt = now; }
+    m.syncDrive();
     if (this.phase !== 'run') return;
     if (now >= this.windowEnd) {
       // a window is a third of the settle time; fresh writes in it, or a new layer, are progress
-      if (m.fresh >= 128 || this.cur !== this.progressLayer) { this.progressLayer = this.cur; this.progressAt = now; }
+      if (m.fresh >= 128 || this.cur !== this.progressLayer) { this.progressLayer = this.cur; this.progressAt = now; this.driveBusy = 0; }
       this.freshSum += m.fresh;
       m.fresh = 0;
       m.freshMark = this.windowIcount;
       this.windowIcount = m.icount;
       this.windowEnd = now + this.settleCycles / 3;
     }
+    if (this.drive?.motorOn) {
+      if (!this.driveBusy) this.driveBusy = now;
+      if (now - this.driveBusy < DRIVE_PATIENCE) this.progressAt = now;
+    } else this.driveBusy = 0;
     if (!this.holdUntil && now - this.progressAt >= this.settleCycles) this.settled();
   }
 
@@ -603,15 +648,23 @@ class Session {
     this.trap(0xf4a5, KERNAL, () => {
       if (this.phase === 'load') {
         this.loadFile();
+        // from a disk the file came from device 8 (LOAD"*",8,1): loaders take the drive's number from here
+        if (this.drive) { m.ram[0xba] = 8; m.ram[0xb9] = 1; }
         const end = this.loadAt + this.data.length;
         cpu.x = end & 0xff; cpu.y = (end >> 8) & 0xff; cpu.c = 0;
         this.setPhase('loaded');
         return this.rts(200);
       }
+      // with a disk the KERNAL loads it from the drive
+      if (this.drive && m.ram[0xba] === 8) { this.trace(`loads "${this.fileName()}"`); return false; }
       this.stop('load', `loads "${this.fileName()}" from device ${m.ram[0xba]}`);
       return true;
     });
-    this.trap(0xf5ed, KERNAL, () => { this.stop('save', `saves "${this.fileName()}"`); return true; });
+    this.trap(0xf5ed, KERNAL, () => {
+      if (this.drive && m.ram[0xba] === 8) { this.trace(`saves "${this.fileName()}"`); return false; }
+      this.stop('save', `saves "${this.fileName()}"`);
+      return true;
+    });
     this.trap(0xfce2, KERNAL, () => { if (!this.started) return false; this.stop('reset', 'resets the C64'); return true; });
     this.trap(0xf1ca, KERNAL, () => { this.print(cpu.a); return this.real ? false : (cpu.c = 0, this.rts()); });
 
@@ -823,6 +876,7 @@ class Session {
       save,
       basic,
       roms: this.real ? this.o.roms!.source : 'stand-ins (no ROM files)',
+      drive: this.drive ? `${this.driveNote}, ${this.drive.bytesRead} bytes read${this.drive.bytesWritten ? `, ${this.drive.bytesWritten} written` : ''}` : this.driveNote,
       cycles: this.started ? m.cycles - this.startCycle : 0,
       ms,
     };
