@@ -1,0 +1,6 @@
+# text is stored with LF and checked out as the platform likes it
+* text=auto
+
+*.cmd text eol=crlf
+*.prg binary
+*.bin binary
