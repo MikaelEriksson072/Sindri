@@ -15,7 +15,7 @@
  * loaders' alike. With a tape, the datasette plays it from where the file ended: the program's own tape loader reads
  * it, and the KERNAL's LOAD from the tape reads on from there (a T64's files only LOAD reads). Then the newest layer is
  * the unpacked program. An intro that waits before anything was unpacked gets keys pressed (space and fire first). */
-import { BASIC, BOOT, C64, KERNAL, LOADED, POWER_ON, READ_CLOCK, READ_INPUT, READ_NEXT, ZP, type MachineState, type Roms } from './c64.ts';
+import { BASIC, BOOT, C64, KERNAL, LOADED, POWER_ON, RAN_BRK, READ_CLOCK, READ_INPUT, READ_IO, READ_IRQ, READ_NEXT, ZP, type MachineState, type Roms } from './c64.ts';
 import { OP_IRQ, OP_NMI } from './cpu.ts';
 import { LEN } from './opcodes.ts';
 import { initStandIn, KERNAL_VECTORS, standInRoms } from './standin.ts';
@@ -100,6 +100,9 @@ export interface LayerReport {
   from: number | null;
   /** the C64 time it started, in cycles after the program started */
   cycle: number;
+  /** with a tape: where it stood when the layer started (the next pulse; a T64: its directory slot). A layer that
+   *  starts once the tape has passed a file of a turbo loader started after that file was loaded */
+  tape?: number;
   /** it is a BASIC program started with RUN (entry is then the BASIC routine jumped to) */
   basic: boolean;
   kind: Kind;
@@ -234,6 +237,8 @@ class Layer {
   image: Uint8Array | null = null;
   /** the drive's bus changes when it started (Drive.busChanges) */
   driveBus = 0;
+  /** where the tape stood when it started (Datasette.pos), null without one */
+  tape: number | null = null;
   activity: Activity | null = null;
   calls: { entry: number; via: Via }[] = [];
   printed = '';
@@ -325,6 +330,13 @@ const TAPE_PAUSE_PATIENCE = 5_000_000;
  *  FOR I=0 TO 7000 in BASIC (7 s); then they load on. (A main loop that waits for a byte its interrupt handler counts
  *  is not taken for one: demos that wait for the next frame so made the C64 time 2.5 times as long) */
 const TIME_PATIENCE = 30_000_000;
+/** a program waits for time when its code outside the interrupt handlers writes no more bytes of RAM than this in a
+ *  window (and some), the stack left out, reading no I/O register and no byte an interrupt handler wrote: it counts
+ *  down in RAM. Thrust's Firebird jingle waits between its notes in three nested `dec abs / bne` loops at $6118 (3
+ *  bytes, 12 s in all), then the tape loads on. (A main loop that keeps a few variables while it waits for the raster
+ *  or for its interrupt handler reads an I/O register or what that handler wrote; a crash going round a BRK through a
+ *  vector in RAM, such as I.C.U.P.S's at $0002/$ffff, writes a byte each time but runs into a BRK) */
+const COUNTERS = 8;
 
 /** Unpack a PRG (load address first). */
 export function unpack(file: Uint8Array, options: UnpackOptions = {}): UnpackResult {
@@ -388,8 +400,9 @@ class Session {
   private windowIcount = 0;
   private freshSum = 0;
   private holdUntil = 0;
-  /** the fresh writes of the last windows, with the cycle each began */
-  private windowFresh: { at: number; fresh: number; reads: number }[] = [];
+  /** the fresh writes of the last windows, with the cycle each began, what the code outside the interrupt handlers read
+   *  (C64.mainReads) and how many bytes it wrote (C64.mainWritten) */
+  private windowFresh: { at: number; fresh: number; reads: number; written: number }[] = [];
   /** the open calls that are interrupts, and how many there are */
   private readonly callIrq = new Uint8Array(CALLS);
   private irqOpen = 0;
@@ -774,6 +787,26 @@ class Session {
     for (const t of [this.m.firstOp, this.m.firstArg, this.m.firstRead, this.m.firstWrite]) t.fill(0);
   }
 
+  /**
+   * The file's bytes that something wrote over since the load, put back as the file has them, and what the run does
+   * with them counted from here: a program started at an address is in memory as VICE's monitor loads it, with nothing
+   * typed after it (the trap at SYS's jump). $0014-$0015 stay, as the jump reads them.
+   */
+  private putBack(): void {
+    const m = this.m, put: Range[] = [];
+    for (let i = 0; i < this.data.length; i++) {
+      const a = this.loadAt + i;
+      if (a < 2 || a > 0xffff || a === 0x14 || a === 0x15 || m.ram[a] === this.data[i]) continue;
+      m.ram[a] = this.data[i];
+      m.wid[a] = LOADED;
+      m.wtime[a] = m.icount;
+      const last = put[put.length - 1];
+      if (last && a - last.end <= 8) last.end = a; else put.push({ start: a, end: a });
+    }
+    this.runFromHere();
+    if (put.length) this.trace(`put back the file's bytes typing wrote over: ${put.map(r => r.start === r.end ? hex4(r.start) : `${hex4(r.start)}-${hex4(r.end)}`).join(' ')}`);
+  }
+
   /** Type a line into the keyboard buffer (10 characters at most, RETURN added). */
   private typeLine(text: string): void {
     const m = this.m, bytes = [...text].map(c => c.charCodeAt(0)).concat(0x0d).slice(0, 10);
@@ -811,6 +844,7 @@ class Session {
     this.phase = 'run';
     const root = new Layer(0, null, pc, 'start', null, m.cycles, m.icount, this.snapshot());
     root.driveBus = this.busChanges();
+    root.tape = this.tape?.pos ?? null;
     this.layers = [root];
     this.owner.fill(0, Math.max(2, this.loadAt), this.loadAt + this.data.length);
     this.cur = root; this.curId = 0;
@@ -866,7 +900,7 @@ class Session {
       if (this.started) {
         const op = cpu.lastOp;
         if (op === 0x20) this.call((pc + 3) & 0xffff);
-        else if (op === 0x00) this.call((pc + 2) & 0xffff);
+        else if (op === 0x00) { this.call((pc + 2) & 0xffff); m.mainReads |= RAN_BRK; }
       }
       if (m.irqDue() && !(cpu.lastOp === 0x40 ? cpu.i : iWas)) { this.interrupted(pc); m.advance(m.takeIrq()); this.call(this.irqRet, true); }
       if (m.nmiDue()) { this.interrupted(pc); m.advance(m.takeNmi()); this.call(this.irqRet, true); }
@@ -982,6 +1016,7 @@ class Session {
     const layer = new Layer(++this.nextId, parent, pc, VIA[op] ?? 'jmp', from, m.cycles, m.icount, this.snapshot());
     layer.basic = basic;
     layer.driveBus = this.busChanges();
+    layer.tape = this.tape?.pos ?? null;
     const kinds = new Map(this.layers.filter(l => l.activity).map(l => [l.id, l.activity!.kind]));
     layer.mask = contentMask(m, parent.id, parent.snapshot.ram, kinds);
     for (let a = 0; a < 0x10000; a++) if (layer.mask[a]) this.owner[a] = layer.id;
@@ -1065,10 +1100,11 @@ class Session {
       if (bus - this.windowBus >= LOADS) this.progressAt = now;
       this.windowBus = bus;
       this.freshSum += m.fresh;
-      this.windowFresh.push({ at: this.windowEnd - this.settleCycles / 3, fresh: m.fresh, reads: m.mainReads });
+      this.windowFresh.push({ at: this.windowEnd - this.settleCycles / 3, fresh: m.fresh, reads: m.mainReads, written: m.mainWritten });
       if (this.windowFresh.length > 4) this.windowFresh.shift();
       m.fresh = 0;
       m.mainReads = 0;
+      m.clearMainWritten();
       this.shots = [this.shots.at(-1) ?? [], this.screenRows()];
       m.freshMark = this.windowIcount;
       this.windowIcount = m.icount;
@@ -1091,20 +1127,25 @@ class Session {
 
   /**
    * The program waits for time, not for the user: in the windows since it last made progress its code outside the
-   * interrupt handlers read no input, and in the last one it read the clock, or BASIC went round a FOR loop. It has
-   * TIME_PATIENCE from its last progress, once until it makes progress again.
+   * interrupt handlers read no input, and in the last one it read the clock, BASIC went round a FOR loop, or it
+   * counted in a few bytes of RAM (it wrote at most COUNTERS, and read no I/O register and no byte an interrupt
+   * handler wrote, and ran into no BRK), or it so counted in the window before (the count may have run out in the
+   * last one, the program going on with its work, which has not made progress yet). It has TIME_PATIENCE from its
+   * last progress, once until it makes progress again.
    */
   private waitsForTime(now: number): boolean {
     const third = this.settleCycles / 3;
     let reads = 0;
     for (const w of this.windowFresh) if (w.at + third > this.progressAt) reads |= w.reads;
-    const last = this.windowFresh.at(-1)?.reads ?? 0;
-    const waits = !this.timeSpent && !(reads & READ_INPUT) && (last & (READ_CLOCK | READ_NEXT)) !== 0;
+    const n = this.windowFresh.length, last = this.windowFresh[n - 1]?.reads ?? 0;
+    const counter = [this.windowFresh[n - 1], this.windowFresh[n - 2]].find(w => w && w.at + third > this.progressAt
+      && w.written > 0 && w.written <= COUNTERS && !(w.reads & (READ_IO | READ_IRQ | RAN_BRK)));
+    const waits = !this.timeSpent && !(reads & READ_INPUT) && ((last & (READ_CLOCK | READ_NEXT)) !== 0 || counter != null);
     if (!waits) return false;
     const pc = this.m.cpu.pc;
     if (this.timeWait !== this.progressAt) {
       this.timeWait = this.progressAt;
-      const what = last & READ_NEXT ? 'BASIC goes round a FOR loop' : 'reads the clock';
+      const what = last & READ_NEXT ? 'BASIC goes round a FOR loop' : last & READ_CLOCK ? 'reads the clock' : `counts in ${counter!.written} bytes of RAM`;
       this.trace(`waiting at ${hex4(pc)}: ${what} and no keys, so it waits for time (up to ${TIME_PATIENCE / 1e6} s)`);
     }
     if (now - this.progressAt < TIME_PATIENCE) return true;
@@ -1367,11 +1408,19 @@ class Session {
         const link = (m.ram[0x2b] | (m.ram[0x2c] << 8)) + 1;
         return link >= this.loadAt && link < this.loadAt + this.data.length ? this.rts() : false;
       });
-      // SYS jumps to the program with JMP ($0014): a start with its own $01 gets it right before (as Build & Run's
-      // stub sets it), so a program under the BASIC ROM is what runs, not the ROM
+      // SYS jumps to the program with JMP ($0014). Started at an address, the file is in memory as it has it, as Build &
+      // Run puts it: VICE loads a program over the screen from the monitor at the READY prompt and types nothing after
+      // it. Here LOAD and SYS were typed at the prompt, and READY. and the SYS line went onto the screen: over a program
+      // that covers it, its bytes (Delta's game, $02a1-$ffff from $1770, has its sound routine at $0403-$059a, and
+      // READY. on row 8 and SYS6000 on row 9 were 13 bytes of it: the game ran into a BRK at its first sound). So
+      // right before the jump the file's bytes the KERNAL and BASIC wrote over since the load are put back (putBack).
+      // A start with its own $01 gets it then too (as Build & Run's stub sets it), so a program under the BASIC ROM
+      // is what runs, not the ROM
       const port = this.o.port, entry = this.o.entry;
-      if (port != null && entry != null) this.trap(0xe144, KERNAL, () => {
-        if (!this.started && (m.ram[0x14] | (m.ram[0x15] << 8)) === entry) m.write(1, port & 0xff);
+      if (entry != null) this.trap(0xe144, KERNAL, () => {
+        if (this.started || (m.ram[0x14] | (m.ram[0x15] << 8)) !== entry) return false;
+        this.putBack();
+        if (port != null) m.write(1, port & 0xff);
         return false;
       });
       return;
@@ -1608,7 +1657,7 @@ class Session {
     const packer = a.kind === 'program' ? null : identify(a.opcodes);
     const range = index > 0 && l.mask ? this.rangeOf(l) : null;
     return {
-      index, entry: l.entry, via: l.via, from: l.from, cycle: l.cycle - this.startCycle, basic: l.basic,
+      index, entry: l.entry, via: l.via, from: l.from, cycle: l.cycle - this.startCycle, ...(l.tape != null ? { tape: l.tape } : {}), basic: l.basic,
       kind: a.kind, code: a.code, instructions: a.instructions,
       written: a.written, writtenBytes: a.writtenBytes, read: a.read, readBytes: a.readBytes,
       calls: l.calls, fingerprint: fingerprintId(a.opcodes), opcodes: a.opcodes, packer,

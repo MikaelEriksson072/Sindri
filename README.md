@@ -29,6 +29,12 @@ autostart's default); `RUN:` starts its line `6000 SYS2061`. Graphics and revers
 screen editor reads a reversed space as a space, the tokenizer drops `$80-$fe`), and there, as on an empty row, `RUN`
 is typed without the colon. `SYS` never gets one: the number ends at the first letter and the program starts, and a
 colon would be one more of the file's bytes typed over (Coop Demo by Digitech keeps its loader's table on that row).
+Started at an address (`entry`, `-e`), as a program Sindri saved is, it types `SYS` instead, and the file is in memory
+as it has it when the jump comes, as Mimir's Build & Run puts it in VICE (loaded from the monitor, nothing typed after
+it): LOAD's relinking of BASIC's lines at `$0801` is left out, and right before the jump the file's bytes that
+`READY.` and the typed line wrote over (on the screen at `$0540` and `$0568`, in the input and keyboard buffers) are
+put back. Delta's game, which Sindri saves as `$02a1-$ffff` from `$1770`, has its sound routine on the screen's
+`$0403-$059a`; with 13 of its bytes typed over it ran into a BRK at its first sound.
 
 The RAM powers on as VICE (x64sc 3.10) fills it by default (`POWER_ON`): four bytes of `$00` and four of `$ff` from
 `$0002` on, inverted in every other 16 KB; the start-up then clears `$0002-$0101` and `$0200-$03ff` and leaves the rest
@@ -44,7 +50,19 @@ VICE 3.10 with test programs after a cycle-exact raster sync (`test/timing.test.
 an instruction's last cycle with the level it had a cycle before, so a raster IRQ that comes in the last cycle waits
 for the next instruction, and a taken branch that stays in its page polls a cycle earlier still. A CIA timer started
 by a write counts from the third cycle after it, and from the fourth when the write also loads it (force load); an
-indexed read across a page reads I/O in its extra last cycle. Before November 2026 an IRQ was taken after the
+indexed read across a page reads I/O in its extra last cycle. A write to a control register that loads a running timer
+again or stops it keeps an underflow the old count reached up to two cycles after the write (a load) or one (a stop):
+measured in VICE with timer A one-shot from 562 started by `STA $DD0E`, loaded again 563 cycles or more after that
+write, or stopped 564 or more after it, `LDA $DD0D` right after shows the underflow. Until 17 November 2026 the timer
+was set anew before the C64 counted the writing instruction's earlier cycles, and an underflow in them was lost (up to
+568 cycles): Firebird's tape loader restarts the timer at each pulse and takes an underflow for a 1, and on the
+Preservers' dump of Seabase Delta a FLAG edge came just after the handler had read `$dc0d` for a timer A interrupt, the
+next restart came 96 cycles late, and a long pulse (664 cycles) read as a 0; the loader then never found its next
+block. A read of `$dc0d`/`$dd0d` sees, the same way, an underflow the timer reaches in the reading instruction's own
+cycles up to the read's, and takes it: the flag does not come up again after the read. Measured in VICE: `LDA $DD0D`
+reading 565 cycles or more after the start shows the underflow, and a second read 8 cycles later shows it only when
+it came after the first. Sindri saw it from 569 cycles before, an underflow in the reading instruction coming up after
+the read and staying for the next one. Before November 2026 an IRQ was taken after the
 instruction in which it came and a forced load counted as a start: The Wild Bunch (#1 of 2006), which corrects its IRQ
 jitter with CIA timer A, read its timer a few cycles off and branched past the end of its delay into a JAM, and a
 copy of Royal Arte (#1 of 2001) took a stray IRQ at the one place in a copy loop where it breaks the demo. A CIA
@@ -172,7 +190,18 @@ limit, though seven programs got further (Dominion and Super Slalom to their gam
 before on 703 programs of the archive (Games Top200's 229 disks, the 161 one-file demos of Onefile-top200, 213 intros,
 100 Year-top20 disks), 6 runs waited for time and one result changed: a BASIC intro (Fuck 'Em All) whose setup counts
 FOR loops now gets to its GET loop, and the saved program has the code at `$c000-$c730` it calls; the C64 time grew by
-1.5 %. On the tapes see below. When an intro waits before anything
+1.5 %. On the tapes see below. A program that counts down in a few bytes of RAM waits for time too: its code outside
+the interrupt handlers wrote 1 to 8 bytes of RAM in the window (the stack left out), read no I/O register and no byte
+an interrupt handler wrote last, and ran into no BRK, in the last window or the one before (the count may have run
+out in the last one, the work after it not yet progress). Thrust's Firebird jingle waits between its notes in three
+nested `dec abs / bne` loops at `$6118` (3 bytes, 12 s in all) before the loader reads on; Sindri settled there after
+1.5 s, now both Thrust tapes load whole and reach the game. A main loop that counts while it waits for the raster or
+for its interrupt handler reads an I/O register or what the handler wrote, and a crash going round a BRK through a
+vector in RAM (I.C.U.P.S: `$ffff ISC $252f,X` / `$0002 BRK`) writes a byte each time but runs into a BRK: they settle
+as before. Measured on 17 November 2026 against the version before on the same 703 programs: 15 waited for a count,
+72.7 s more C64 time (1.1 %), and one result changed: RaytraceNightmare (No Bounds, 2023) counts on and its saved
+layer reaches `$ffff` instead of `$c7df`. Sindri's speed per instruction is the same. Of the 57 tapes with Firebird's
+loader 51 now load whole (48 before: both Thrust tapes and the Preservers' Seabase Delta), none fewer. When an intro waits before anything
 was unpacked, keys are pressed in turn (space and fire first, then return, N, F1, Y, F7, 1) until it reacts to one;
 then the list goes round again, from space when a new program started, else from the key it took. A trainer menu that
 asks its questions one after another ("Unlimited lives (Y/N)") takes N with little: it puts the next question up. That
@@ -305,7 +334,11 @@ With a tape (a TAP image, given instead of the file or with `--tape`) a datasett
   and Sindri took that for the program, saving the loader at `$fd03` (which loads the parts again from the tape) in
   place of the game at `$6440`. The report's `Tape:` line says where the tape stood
   and how far it played; pulses read count as loading for the parts a layer loaded and ran. The saved port is the
-  program's: bit 4, which PLAY holds low, is left out.
+  program's: bit 4, which PLAY holds low, is left out;
+- each layer says where the tape stood when it began (`LayerReport.tape`, the next pulse): a layer that began once the
+  tape had passed a turbo file began after the loader had loaded that file. Mimir uses it to run a turbo loader's file
+  that does not run from where it loads (a Wildload chain's block) from the tape's boot file, and to tell the layers
+  that unpack it from the loader reading on.
 
 A T64 (the C64S emulator's tape archive, given instead of the file or with `--tape`) holds a tape's files, not its
 pulses: a 64-byte header (a signature line such as `C64S tape image file`, the version, the directory's room and the
@@ -392,7 +425,7 @@ address, unp64 unpacks.
 | `--disk FILE` | put this D64 or G64 in the drive for a PRG given on its own |
 | `--next FILE` | the disk to turn to when the program asks for it and waits (a demo's next side); once for each, in order |
 | `--tape FILE` | put this TAP or T64 in the datasette for a PRG given on its own |
-| `-e ADDR` | start with `SYS ADDR` instead of `RUN` |
+| `-e ADDR` | start with `SYS ADDR` instead of `RUN`, with the file in memory as it has it (nothing typed over it) |
 | `--port VALUE` | with `-e`: `$01` as the program starts there, set right before the jump (a saved program's start hint, `$36` say: a game that starts under the BASIC ROM) |
 | `-l ADDR` | load the file at `ADDR` instead of its own load address |
 | `--layer N` | save layer N instead of the newest (the report lists them) |
