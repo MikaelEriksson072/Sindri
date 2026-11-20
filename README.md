@@ -1,5 +1,7 @@
 # Sindri
 
+<img src="icons/png/sindri-256.png" alt="Sindri's icon" width="128" align="right">
+
 **Sindri is a generic unpacker for Commodore 64 programs.** It runs a packed PRG in an emulated C64, follows it
 through its layers (coders, movers, decrunchers, intros in front of them) and saves the unpacked program at the moment
 it starts.
@@ -652,6 +654,13 @@ with an end of `$c3c6`, one past its bytes, 0 entries said used and a slot of te
 - An intro that waits for something other than the keys it tries stays where it is; `-e` can start the program behind
   it. A trainer menu that shows an answer only in colour, or with fewer than eight characters in a row (a marker that
   moves, a YES), is taken as one that does not react: each key is pressed once there.
+
+## Icon
+
+`icons/` holds Sindri's icon in the sizes and formats programs ask for: PNGs from 16 to 1024 pixels (`icons/png/`),
+`sindri.ico` for Windows (16 to 256 pixels in one file) and `sindri.icns` for macOS (16 to 1024 pixels, on Apple's grid
+with its margin and shadow). From 16 to 48 pixels it shows the middle of the icon, the rune on its rings, so that the
+rune can still be read.
 
 ## License
 
